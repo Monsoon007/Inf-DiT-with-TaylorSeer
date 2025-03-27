@@ -608,147 +608,290 @@ class DiffusionEngine(BaseModel):
         
         kwargs['input_ids'] = kwargs['position_ids'] = kwargs['attention_mask'] = torch.ones((1,1)).to(sigmas.dtype)
         return super().forward(*args, **kwargs)
-    
+
     def precond_forward(self, inference, rope_position_ids, concat_lr_imgs, lr_imgs=None, ar=False,
                         ar2=False, sample_step=None, block_batch=1, *args, **kwargs):
+        """
+        执行扩散模型的前向推理，支持三种推理模式：全图推理、逐块自回归推理(ar)和批量块自回归推理(ar2)
+
+        参数:
+            inference: 布尔值，指示是否处于推理模式
+            rope_position_ids: 用于旋转位置编码(RoPE)的位置ID张量
+            concat_lr_imgs: 用于与主图像拼接的低分辨率图像
+            lr_imgs: 原始低分辨率图像，用于条件生成，可选
+            ar: 布尔值，是否使用自回归模式(每次处理一个块)
+            ar2: 布尔值，是否使用批量自回归模式(每次处理多个块)
+            sample_step: 当前采样步骤，用于确定处理方向
+            block_batch: 在ar2模式下每次处理的块批次大小
+            *args, **kwargs: 传递给model_forward的额外参数
+
+        返回:
+            处理后的图像张量
+        """
+        # 从kwargs中获取输入图像和噪声水平
         images, sigmas = kwargs["images"], kwargs["sigmas"]
 
+        # 将低分辨率图像与主图像在通道维度上拼接，增加条件信息
         images = torch.cat((images, concat_lr_imgs), dim=1)
 
-        # TODO: reduce LR image memory cost
+        # TODO: 优化低分辨率图像的内存使用
         # lr_imgs = lr_imgs[:, :, :128, :128]
+
+        # 如果启用了cross_lr选项，对低分辨率图像进行预处理
         if self.mixins['adaln_layer'].cross_lr:
             lr_imgs = self.mixins['adaln_layer'].process_lr(lr_imgs)
 
-
+        # 获取图像的高度和宽度
         h, w = images.shape[2:4]
+
+        # 计算扩散过程中的各种系数
+        # c_skip: 原始图像的权重系数
+        # c_out: 模型输出的权重系数
+        # c_in: 模型输入的缩放系数
+        # c_noise: 噪声的缩放系数
         c_skip, c_out, c_in, c_noise = map(lambda t: t.to(images.dtype), self.precond(append_dims(sigmas, images.ndim)))
 
+        # 应用缩放因子调整图像值范围
         images *= self.scale_factor
 
-        if inference and ar: # block_batch=1
+        # 模式1：自回归(AR)模式 - 每次处理一个块
+        if inference and ar:  # block_batch=1
+            # 确保block_batch为1，因为AR模式下每次只处理一个块
             assert block_batch == 1
-            block_size = self.image_block_size
-            vit_block_size = block_size // self.patch_size
+
+            # 设置块的大小和ViT(Vision Transformer)块大小
+            block_size = self.image_block_size  # 图像块大小(像素)
+            vit_block_size = block_size // self.patch_size  # ViT块大小(patch数量)
+
+            # 计算块的行数和列数
             block_h, block_w = h // block_size, w // block_size
+
+            # 重塑位置ID张量以匹配图像块的结构
             rope_position_ids = rope_position_ids.view(-1, h // self.patch_size, w // self.patch_size, 2)
-            samples = []
-            cached = [None] * block_w
-            images = images
+
+            samples = []  # 存储每一行的处理结果
+            cached = [None] * block_w  # 缓存每列的处理结果
+
+            # 根据随机方向选项和当前采样步骤确定处理方向
+            # 偶数步骤从左上到右下，奇数步骤从右下到左上(如果启用了random_direction)
             if self.random_direction and sample_step is not None and sample_step % 2 == 1:
+                # 从右下到左上的处理顺序
                 range_i = range(block_h - 1, -1, -1)
                 range_j = range(block_w - 1, -1, -1)
             else:
+                # 从左上到右下的处理顺序
                 range_i = range(block_h)
                 range_j = range(block_w)
+
+            # 按行遍历图像块
             for i in range_i:
-                previous = None
-                sample_row = []
+                previous = None  # 存储上一个块的处理结果
+                sample_row = []  # 存储当前行的处理结果
+
+                # 按列遍历图像块
                 for j in range_j:
-                    tmp_images = images[:, :, i*block_size:(i+1)*block_size, j*block_size:(j+1)*block_size]
-                    tmp_position_ids = rope_position_ids[:, i*vit_block_size:(i+1)*vit_block_size, j*vit_block_size:(j+1)*vit_block_size].contiguous().view(-1, vit_block_size * vit_block_size, 2)
-                    kwargs["images"] = tmp_images * c_in
-                    kwargs["sigmas"] = c_noise.reshape(-1)
-                    kwargs["rope_position_ids"] = tmp_position_ids
-                    mems = []
+                    # 提取当前块的图像数据
+                    tmp_images = images[:, :, i * block_size:(i + 1) * block_size, j * block_size:(j + 1) * block_size]
+
+                    # 提取当前块的位置ID
+                    tmp_position_ids = rope_position_ids[:, i * vit_block_size:(i + 1) * vit_block_size,
+                                       j * vit_block_size:(j + 1) * vit_block_size].contiguous().view(-1,
+                                                                                                      vit_block_size * vit_block_size,
+                                                                                                      2)
+
+                    # 更新kwargs中的参数
+                    kwargs["images"] = tmp_images * c_in  # 应用输入缩放系数
+                    kwargs["sigmas"] = c_noise.reshape(-1)  # 重塑噪声系数
+                    kwargs["rope_position_ids"] = tmp_position_ids  # 更新位置ID
+
+                    mems = []  # 用于存储记忆值的列表
+
+                    # 如果当前列有缓存的记忆值，加入mems
                     if cached[j] is not None:
                         mems.append(cached[j])
+
+                    # 如果不是第一列，使用前一列的缓存和前一个块的结果作为条件
                     if j != 0:
-                        if cached[j-1] is not None:
-                            mems.append(cached[j-1])
+                        if cached[j - 1] is not None:
+                            mems.append(cached[j - 1])
                         mems.append(previous)
+
+                    # 计算当前块对应的低分辨率图像索引
                     lr_id = i * block_w + j
-                    output, *output_per_layers = self.model_forward(*args, hw=[vit_block_size, vit_block_size], mems=mems, inference=1, lr_imgs=lr_imgs[lr_id:lr_id+1], **kwargs)
+
+                    # 执行模型前向传播
+                    output, *output_per_layers = self.model_forward(*args, hw=[vit_block_size, vit_block_size],
+                                                                    mems=mems, inference=1,
+                                                                    lr_imgs=lr_imgs[lr_id:lr_id + 1], **kwargs)
+
+                    # 应用输出缩放系数和跳跃连接
                     output = output * c_out + tmp_images[:, :self.out_channels] * c_skip
+
+                    # 更新缓存
                     if j != 0:
-                        cached[j-1] = previous
-                    if j == block_w - 1:
+                        cached[j - 1] = previous
+
+                    # 根据位置更新缓存或previous变量
+                    if j == block_w - 1:  # 如果是行的最后一个块
                         cached[j] = output_per_layers
                     else:
                         previous = output_per_layers
+
+                    # 将处理后的块加入当前行结果
                     sample_row.append(output)
 
+                # 在水平方向上拼接当前行的所有块
                 sample_row = torch.cat(sample_row, dim=3)
                 samples.append(sample_row)
-            samples = torch.cat(samples, dim=2)
-            return 1. / self.scale_factor * samples
-        elif inference and ar2:  # block_batch>1
-            block_size = self.image_block_size  # hard code
-            vit_block_size = block_size // self.patch_size
-            block_h, block_w = h // block_size, w // block_size
-            rope_position_ids = rope_position_ids.view(-1, h // self.patch_size, w // self.patch_size, 2)
-            samples = []
-            cached = [None] * block_w
-            images = images
 
-            block_bsize = block_size * block_batch
-            vit_block_bsize = vit_block_size * block_batch
+            # 在垂直方向上拼接所有行，形成完整输出图像
+            samples = torch.cat(samples, dim=2)
+
+            # 应用反缩放因子并返回结果
+            return 1. / self.scale_factor * samples
+
+        # 模式2：批量自回归(AR2)模式 - 每次处理多个块
+        elif inference and ar2:  # block_batch>1
+            block_size = self.image_block_size  # 图像块大小
+            vit_block_size = block_size // self.patch_size  # ViT块大小
+            block_h, block_w = h // block_size, w // block_size  # 块的行数和列数
+            rope_position_ids = rope_position_ids.view(-1, h // self.patch_size, w // self.patch_size, 2)  # 重塑位置ID
+
+            samples = []  # 存储每一行的处理结果
+            cached = [None] * block_w  # 缓存每列的处理结果
+
+            # 批量块大小计算
+            block_bsize = block_size * block_batch  # 批量图像块大小
+            vit_block_bsize = vit_block_size * block_batch  # 批量ViT块大小
+
+            # 确保块数量可以被batch_size整除
             assert block_h % block_batch == 0
             assert block_w % block_batch == 0
+
+            # 计算批量块的行数和列数
             block_batch_h = block_h // block_batch
             block_batch_w = block_w // block_batch
+
+            # 设置迭代范围
             range_i = range(block_batch_h)
             range_j = range(block_batch_w)
+
+            # 按行遍历批量块
             for i in range_i:
-                previous = None
-                sample_row = []
+                previous = None  # 存储上一个批量块的处理结果
+                sample_row = []  # 存储当前行的处理结果
+
+                # 按列遍历批量块
                 for j in range_j:
+                    # 提取当前批量块的图像数据
                     tmp_images = images[:, :, i * block_bsize:(i + 1) * block_bsize,
                                  j * block_bsize:(j + 1) * block_bsize]
+
+                    # 提取当前批量块的位置ID
                     tmp_position_ids = rope_position_ids[:, i * vit_block_bsize:(i + 1) * vit_block_bsize,
-                                       j * vit_block_bsize:(j + 1) * vit_block_bsize].contiguous().view(-1, vit_block_bsize * vit_block_bsize, 2)
+                                       j * vit_block_bsize:(j + 1) * vit_block_bsize].contiguous().view(-1,
+                                                                                                        vit_block_bsize * vit_block_bsize,
+                                                                                                        2)
+
+                    # 更新kwargs中的参数
                     kwargs["images"] = tmp_images * c_in
                     kwargs["sigmas"] = c_noise.reshape(-1)
                     kwargs["rope_position_ids"] = tmp_position_ids
+
+                    # 初始化mems列表，用于存储记忆值
                     mems = [None, None, None]
+
+                    # 定义辅助函数，用于提取记忆键值对的前两个元素
                     def get_top_concat(x):
                         return [{"mem_kv": y['mem_kv'][:2]} for y in x]
+
+                    # 如果不是第一列，使用前一个批量块的结果和前一列的缓存
                     if j != 0:
                         mems[0] = previous
                         if cached[j - 1] is not None:
                             mems[1] = cached[j - 1]
+
+                    # 如果当前列有缓存，使用它
                     if cached[j] is not None:
                         mems[2] = cached[j]
+
+                    # 执行模型前向传播
                     output, *output_per_layers = self.model_forward(*args, hw=[vit_block_bsize,
                                                                                vit_block_bsize],
-                                                                    mems=mems, inference=2,  **kwargs)
+                                                                    mems=mems, inference=2, **kwargs)
+
+                    # 应用输出缩放系数和跳跃连接
                     output = output * c_out + tmp_images[:, :self.out_channels] * c_skip
+
+                    # 处理记忆值以减少内存使用
                     if previous is not None:
                         previous = get_top_concat(previous)
+
+                    # 更新缓存
                     if j != 0:
                         cached[j - 1] = previous
-                    if j == block_w - 1:
+
+                    # 根据位置更新缓存或previous变量
+                    if j == block_w - 1:  # 如果是行的最后一个批量块
                         cached[j] = get_top_concat(output_per_layers)
                     else:
                         previous = output_per_layers
+
+                    # 将处理后的批量块加入当前行结果
                     sample_row.append(output)
 
+                # 在水平方向上拼接当前行的所有批量块
                 sample_row = torch.cat(sample_row, dim=3)
                 samples.append(sample_row)
+
+            # 在垂直方向上拼接所有行，形成完整输出图像
             samples = torch.cat(samples, dim=2)
+
+            # 应用反缩放因子并返回结果
             return 1. / self.scale_factor * samples
+
+        # 模式3：全图处理模式 - 一次性处理整个图像
         else:
+            # 更新kwargs中的参数，用于全图处理
             kwargs["images"] = images * c_in
             kwargs["sigmas"] = c_noise.reshape(-1)
+
+            # 设置默认处理方向为左上到右下(lt)
             direction = "lt"
+
+            # 根据随机方向选项和训练/推理状态调整方向
+            # 如果在训练阶段且随机值>0.5，方向为右下到左上(rb)
             if self.random_direction and torch.rand(1) > 0.5 and not inference:
                 direction = "rb"
+
+            # 如果在推理阶段，根据采样步骤调整方向
+            # 奇数步骤使用从右下到左上的方向
             if self.random_direction and sample_step is not None and sample_step % 2 == 1:
                 direction = "rb"
-            # switch direction
+
+            # 注释掉的方向切换代码
             # if direction == "rb":
             #     direction = "lt"
             # else:
             #     direction = "rb"
+
+            # 将方向参数添加到kwargs中
             kwargs["direction"] = direction
-            output, *output_per_layers = self.model_forward(*args, hw=[h//self.patch_size, w//self.patch_size], rope_position_ids=rope_position_ids, lr_imgs=lr_imgs, **kwargs)
+
+            # 执行模型前向传播，处理整个图像
+            output, *output_per_layers = self.model_forward(*args, hw=[h // self.patch_size, w // self.patch_size],
+                                                            rope_position_ids=rope_position_ids,
+                                                            lr_imgs=lr_imgs, **kwargs)
+
+            # 应用输出缩放系数和跳跃连接
             output = output * c_out + images[:, :self.out_channels] * c_skip
 
-            #calc attention score
+            # 如果启用了注意力收集，保存每层的输出用于分析
             if self.collect_attention is not None:
                 self.collect_attention.append(output_per_layers)
 
-            # output = output.to(in_type)
+            # 应用反缩放因子并返回结果
+            # output = output.to(in_type)  # 注释掉的类型转换
             return 1. / self.scale_factor * output
 
     @torch.no_grad()
