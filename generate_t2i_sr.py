@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import PIL.Image
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader1
+from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import v2
 import random
 import scipy.stats as st

@@ -670,7 +670,7 @@ class DiffusionEngine(BaseModel):
             rope_position_ids = rope_position_ids.view(-1, h // self.patch_size, w // self.patch_size, 2)
 
             samples = []  # 存储每一行的处理结果
-            cached = [None] * block_w  # 缓存每列的处理结果
+            cached = [None] * block_w  # 缓存每列()的处理结果
 
             # 根据随机方向选项和当前采样步骤确定处理方向
             # 偶数步骤从左上到右下，奇数步骤从右下到左上(如果启用了random_direction)
@@ -758,7 +758,7 @@ class DiffusionEngine(BaseModel):
             rope_position_ids = rope_position_ids.view(-1, h // self.patch_size, w // self.patch_size, 2)  # 重塑位置ID
 
             samples = []  # 存储每一行的处理结果
-            cached = [None] * block_w  # 缓存每列的处理结果
+            cached = [None] * block_w  # 缓存每列(对于编程矩阵来说列，对于实际图像是行)的处理结果
 
             # 批量块大小计算
             block_bsize = block_size * block_batch  # 批量图像块大小
@@ -936,81 +936,117 @@ class DiffusionEngine(BaseModel):
         position_ids[position_ids==-1] = 0
 
         return self.precond_forward(rope_position_ids=position_ids, inference=False, *args, **kwargs)
-    
 
     def sample(
-        self,
-        shape,
-        rope_position_ids=None,
-        num_steps=None,
-        images=None,
-        lr_imgs=None,
-        init_noise=True,
-        dtype=torch.float32,
-        device=torch.device('cuda'),
-        return_attention_map=False,
-        image_2=None,
-        do_concat=True,
-        ar=False,
-        ar2=False,
-        block_batch=1,
+            self,
+            shape,  # 输出张量的形状
+            rope_position_ids=None,  # 旋转位置编码的位置ID
+            num_steps=None,  # 采样步骤数
+            images=None,  # 输入图像（可能是初始噪声或低分辨率图像）
+            lr_imgs=None,  # 低分辨率输入图像
+            init_noise=True,  # 是否初始化噪声
+            dtype=torch.float32,  # 计算的数据类型
+            device=torch.device('cuda'),  # 计算设备
+            return_attention_map=False,  # 是否返回注意力图
+            image_2=None,  # 可选的第二输入图像
+            do_concat=True,  # 是否连接低分辨率图像
+            ar=False,  # 是否使用自回归模式
+            ar2=False,  # 是否使用第二种自回归模式
+            block_batch=1,  # 块批处理大小
     ):
-
+        # 如果没有提供输入图像，则创建随机噪声作为起始点
         if images is None:
             images = torch.randn(*shape).to(dtype).to(device)
 
-        cond = {}
-        uncond = {}
+        # 初始化条件和无条件字典
+        cond = {}  # 条件字典，用于指导扩散过程
+        uncond = {}  # 无条件字典，用于分类器引导采样
 
+        # 如果提供了第二张图像，将其添加到条件字典中
         if image_2 is not None:
             cond["image2"] = image_2
 
+        # 如果有图像编码器，处理低分辨率图像并创建嵌入
         if self.image_encoder:
             if image_2 is not None:
                 print("has image2!!!")
                 image_embedding = self.image_encoder(image_2)
             else:
+                # 对低分辨率图像进行编码，并添加文本
                 image_embedding = self.image_encoder(lr_imgs, add_text=True)
+            # 将图像嵌入添加到条件和无条件字典中
             cond["vector"] = image_embedding
             uncond["vector"] = image_embedding
 
+        # 将低分辨率图像添加到条件和无条件字典中
         cond["lr_imgs"] = lr_imgs
         uncond["lr_imgs"] = lr_imgs
 
-        #for cat cfg
+        # 用于分类器引导采样的连接标志（条件为1，无条件为0）
         cond["concat"] = torch.ones(1, dtype=torch.bool, device=images.device)
         uncond["concat"] = torch.zeros(1, dtype=torch.bool, device=images.device)
 
+        # 将输入图像添加到连接条件中
         cond["concat_lr_imgs"] = images
         uncond["concat_lr_imgs"] = images
 
+        # 计算图像补丁数量和位置编码
         h, w = images.shape[2:4]
         num_patches = h * w // (self.patch_size ** 2)
         if rope_position_ids is None:
+            # 创建2D位置编码（行和列）
             position_ids = torch.zeros(num_patches, 2, device=images.device)
             position_ids[:, 0] = torch.arange(num_patches, device=images.device) // (w // self.patch_size)
             position_ids[:, 1] = torch.arange(num_patches, device=images.device) % (w // self.patch_size)
 
+            # 对位置ID进行模运算，确保在有效范围内
             position_ids = position_ids % (8 * self.image_size // self.patch_size)
 
+            # 复制位置ID到批次中的每个样本
             position_ids = torch.repeat_interleave(position_ids.unsqueeze(0), images.shape[0], dim=0).long()
             position_ids[position_ids == -1] = 0
             rope_position_ids = position_ids
 
+        # 启用Transformer输出隐藏状态
         self.transformer.output_hidden_states = True
 
-        denoiser = lambda images, sigmas, rope_position_ids, cond, sample_step: self.precond_forward(images=images,
-            sigmas=sigmas, rope_position_ids=rope_position_ids, inference=True, sample_step=sample_step, do_concat=do_concat,
-                                                                                                     ar=ar, ar2=ar2, block_batch=block_batch, **cond)
+        # 定义去噪函数，使用预条件前向传播
+        denoiser = lambda images, sigmas, rope_position_ids, cond, sample_step: self.precond_forward(
+            images=images,
+            sigmas=sigmas,
+            rope_position_ids=rope_position_ids,
+            inference=True,
+            sample_step=sample_step,
+            do_concat=do_concat,
+            ar=ar,
+            ar2=ar2,
+            block_batch=block_batch,
+            **cond
+        )
 
+        # 如果需要返回注意力图，初始化注意力收集列表
         if return_attention_map:
             self.collect_attention = []
-        samples = self.sampler(denoiser=denoiser, x=None, cond=cond, uc=uncond, num_steps=num_steps, rope_position_ids=rope_position_ids, init_noise=init_noise)
 
+        # 执行采样过程
+        samples = self.sampler(
+            denoiser=denoiser,
+            x=None,
+            cond=cond,
+            uc=uncond,
+            num_steps=num_steps,
+            rope_position_ids=rope_position_ids,
+            init_noise=init_noise
+        )
+
+        # 如果有第一阶段模型，解码生成的样本
         if self.first_stage_model:
             samples = self.decode_first_stage(samples)
 
+        # 禁用Transformer输出隐藏状态
         self.transformer.output_hidden_states = False
+
+        # 返回结果，可能包括注意力图
         if return_attention_map:
             attention_maps = self.collect_attention
             self.collect_attention = None
