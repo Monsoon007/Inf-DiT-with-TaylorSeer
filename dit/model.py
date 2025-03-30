@@ -15,6 +15,7 @@ from sat.transformer_defaults import standard_attention
 
 from sat.ops.layernorm import LayerNorm
 
+from dit.TaylorSeer.taylor_wrapper import TaylorSeerWrapper
 from dit.embeddings import TimeEmbedding, ConditionEmbedding, ImagePatchEmbeddingMixin, BasicPositionEmbeddingMixin
 from dit.embeddings import DDPMTimeEmbedding, RotaryPositionEmbedding
 
@@ -460,7 +461,18 @@ class DiffusionEngine(BaseModel):
             print("--------use random position--------")
 
         self.use_block_attention = True
-        
+
+        self.use_taylorseer = getattr(args, 'use_taylorseer', False)
+        self.taylorseer = None
+
+        if self.use_taylorseer:
+            self.taylorseer = TaylorSeerWrapper(
+                self,
+                interval=args.taylor_interval,
+                max_order=args.taylor_order,
+                test_flops=args.test_flops
+            )
+
         if 'activation_func' not in kwargs:
             approx_gelu = nn.GELU(approximate='tanh')
             kwargs['activation_func'] = approx_gelu
@@ -532,11 +544,14 @@ class DiffusionEngine(BaseModel):
     def _build_modeling(self, args, modeling_configs):
         precond_config = modeling_configs.pop('precond_config')
         self.precond = instantiate_from_config(precond_config)
-        
+
         loss_config = modeling_configs.pop('loss_config')
         self.loss_func = instantiate_from_config(loss_config)
         sampler_config = modeling_configs.pop('sampler_config')
         self.sampler = instantiate_from_config(sampler_config)
+        print(f"[DEBUG] sampler class: {type(self.sampler)}")
+
+        
     
     def disable_untrainable_params(self):
         disable_prefixs = ["text_encoder", "first_stage_model", "image_encoder"]
@@ -591,6 +606,16 @@ class DiffusionEngine(BaseModel):
         group.add_argument('--lr-dropout', default=0, type=float)
         group.add_argument('--re-position', action='store_true')
         group.add_argument('--cross-lr', action='store_true')
+        # === TaylorSeer 参数 ===
+        group.add_argument('--use-taylorseer', action='store_true',
+                           help='Enable TaylorSeer inference skipping')
+        group.add_argument('--taylor-interval', type=int, default=4,
+                           help='Sampling interval for Taylor expansion')
+        group.add_argument('--taylor-order', type=int, choices=[1, 2], default=2,
+                           help='Order of Taylor expansion (1 or 2)')
+        group.add_argument('--test-flops', action='store_true',
+                           help='Print estimated FLOPs statistics')
+
         return parser
     
     @classmethod
@@ -954,6 +979,8 @@ class DiffusionEngine(BaseModel):
             ar2=False,  # 是否使用第二种自回归模式
             block_batch=1,  # 块批处理大小
     ):
+        print(f"[DEBUG] use_taylorseer = {self.use_taylorseer}")
+
         # 如果没有提供输入图像，则创建随机噪声作为起始点
         if images is None:
             images = torch.randn(*shape).to(dtype).to(device)
@@ -1011,18 +1038,56 @@ class DiffusionEngine(BaseModel):
         self.transformer.output_hidden_states = True
 
         # 定义去噪函数，使用预条件前向传播
-        denoiser = lambda images, sigmas, rope_position_ids, cond, sample_step: self.precond_forward(
-            images=images,
-            sigmas=sigmas,
-            rope_position_ids=rope_position_ids,
-            inference=True,
-            sample_step=sample_step,
-            do_concat=do_concat,
-            ar=ar,
-            ar2=ar2,
-            block_batch=block_batch,
-            **cond
-        )
+        def denoiser(images, sigmas, rope_position_ids, cond, sample_step):
+            print(f"[DEBUG] cond['concat'] = {cond['concat']}")
+
+            step = sample_step or 0
+
+            # ✅ 判断当前是否是 cond 分支
+            # is_cond = cond.get("concat", None) is not None and cond["concat"].item()
+            is_cond = cond.get("concat", None) is not None and cond["concat"].sum().item() > 0
+
+            # ✅ 是否启用 Taylor 预测
+            use_taylor = (
+                    self.use_taylorseer and
+                    is_cond and
+                    step >= self.taylorseer.max_order and
+                    self.taylorseer.should_use_taylor(step)
+            )
+
+            if use_taylor:
+                print(f"[Taylor] step {step}: using Taylor prediction")
+                eps = self.taylorseer.predict(
+                    images, t=step, sigmas=sigmas,
+                    rope_position_ids=rope_position_ids, cond=cond
+                )
+            else:
+                eps = self.precond_forward(
+                    images=images,
+                    sigmas=sigmas,
+                    rope_position_ids=rope_position_ids,
+                    inference=True,
+                    sample_step=step,
+                    do_concat=do_concat,
+                    ar=ar,
+                    ar2=ar2,
+                    block_batch=block_batch,
+                    **cond
+                )
+
+                # ✅ 只缓存 cond 分支的 eps
+                if self.use_taylorseer and is_cond:
+                    if len(self.taylorseer.cache_t) == 0 or self.taylorseer.cache_t[0] != step:
+                        self.taylorseer.cache_eps.appendleft(eps.detach())
+                        self.taylorseer.cache_t.appendleft(step)
+                        print(f"[DEBUG] cached step {step}")
+
+            # 🔍 调试日志
+            print(f"[DEBUG] step = {step}, is_cond = {is_cond}, use_taylor = {use_taylor}")
+            if self.use_taylorseer:
+                print(f"[DEBUG] cache_t = {list(self.taylorseer.cache_t)}")
+
+            return eps
 
         # 如果需要返回注意力图，初始化注意力收集列表
         if return_attention_map:
@@ -1051,4 +1116,8 @@ class DiffusionEngine(BaseModel):
             attention_maps = self.collect_attention
             self.collect_attention = None
             return samples, attention_maps
+
+        if self.use_taylorseer and self.taylorseer.test_flops:
+            self.taylorseer.report_flops()
+
         return samples
