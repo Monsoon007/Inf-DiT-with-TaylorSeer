@@ -43,24 +43,21 @@ def read_from_cli():
 
 def read_from_file(p):
     if p.endswith('.txt'):
-        with open(p, 'r') as fin:
+        with open(p, 'r', encoding='utf-8') as fin:
             lines = fin.readlines()
         for line in lines:
-            if line.startswith("#"):
+            line = line.replace('\r', '').strip()
+            if not line or line.startswith("#"):
                 continue
-            line = line.strip().split(' ')
-            if len(line) == 2:
-                line, image_id = line
-                image_id = int(image_id)
-            else:
-                line = line[0]
-                image_id = 0
-            image = Image.open(line).convert('RGB')
-            if image_id == 1:
-                image = image.crop((2, 2, 514, 514))
-            elif image_id == 2:
-                image = image.crop((516, 2, 1028, 514))
-            yield image, line.split('/')[-1].split('.')[0]
+            parts = line.split(' ')
+            try:
+                path = parts[0]
+                image = Image.open(path).convert('RGB')
+                image = transforms.ToTensor()(image) * 2 - 1
+                image = image.unsqueeze(0)
+                yield image, os.path.basename(path).split('.')[0]
+            except Exception as e:
+                print(f"[ERROR] Failed to load image: {line}, reason: {e}")
     else:
         raise NotImplementedError
 
@@ -196,6 +193,12 @@ def add_sample_specific_args(parser):
     group.add_argument('--no_concat', action='store_true')
     group.add_argument('--inference_type', type=str, default='full', choices=['full', 'ar', 'ar2'])
     group.add_argument('--block_batch', type=int, default=1)
+
+    # ✅ 添加 guider 参数
+    group.add_argument('--guider', type=str, default=None,
+                       help='Override guider class (e.g. VanillaCFG, IdentityGuider, TaylorSeerGuider)')
+    group.add_argument('--guiderscale', type=float, default=None, help='Override CFG/TaylorSeer scale')
+
     return parser
 
 
@@ -207,6 +210,7 @@ if __name__ == "__main__":
     args = get_args(args_list)
     del args.deepspeed_config
     args = argparse.Namespace(**vars(args), **vars(known))
+
     main(args)
 
 

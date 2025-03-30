@@ -53,14 +53,21 @@ class BaseDiffusionSampler:
         s_in = x.new_ones([x.shape[0]])
         
         return x, s_in, sigmas, num_sigmas, cond, uc
-    
+
     def denoise(self, x, denoiser, sigma, cond, uc, rope_position_ids, sample_step=None):
+        # 准备输入（可能提前判断 skip）
         images, sigmas, cond, rope_position_ids = self.guider.prepare_inputs(x, sigma, cond, uc, rope_position_ids)
 
-        denoised = denoiser(images, sigmas, rope_position_ids, cond, sample_step)
-        denoised = self.guider(denoised, sigma)
+        if getattr(self.guider, "_skip_step", False):
+            # ⚡ 跳过模型推理
+            denoised = self.guider(None, sigma)
+        else:
+            # 🧠 正常调用 denoiser（DiT 模型）
+            denoised = denoiser(images, sigmas, rope_position_ids, cond, sample_step)
+            denoised = self.guider(denoised, sigma)
+
         return denoised
-    
+
     def get_sigma_gen(self, num_sigmas):
         sigma_generator = range(num_sigmas - 1)
         if self.verbose:
