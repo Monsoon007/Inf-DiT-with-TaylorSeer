@@ -62,11 +62,15 @@ class TaylorSeerGuider:
         self.step_threshold = step_threshold
         self.cache = {}        # step_key -> ε
         self.history = []      # [(sigma, ε)]
-        self._skip_step = False  # 临时标记当前是否跳过模型推理
+        self._skip_cur_step = False  # 临时标记当前是否跳过模型推理
         self._identity_mode = (scale == 0.0)  # 是否等价于 IdentityGuider
 
         if self._identity_mode:
             print("[TaylorSeerGuider] ⚠️  scale=0 → Running in IdentityGuider mode (single batch, no guidance)")
+
+        # ✅ 加入统计项
+        self.total_steps = 0
+        self.skipped_steps = 0
 
     def has_cache_for(self, sigma):
         step_key = sigma[0].item() if isinstance(sigma, torch.Tensor) else sigma
@@ -75,11 +79,13 @@ class TaylorSeerGuider:
     def prepare_inputs(self, x, sigma, cond, uc, rope_position_ids):
         step_key = sigma[0].item() if isinstance(sigma, torch.Tensor) else sigma
 
+        self.total_steps += 1  # ✅ 每次 prepare_inputs 都算一次 step
+
         if self.use_cache and self.has_cache_for(sigma):
-            self._skip_step = True
+            self._skip_cur_step = True
             return None, None, None, None
         else:
-            self._skip_step = False
+            self._skip_cur_step = False
 
         if self._identity_mode:
             # 与 IdentityGuider 一致：只使用 cond，不拼接
@@ -131,3 +137,10 @@ class TaylorSeerGuider:
 
         return guided
 
+    def get_stats(self):
+        skip_ratio = self.skipped_steps / max(self.total_steps, 1)
+        return {
+            "total_steps": self.total_steps,
+            "skipped_steps": self.skipped_steps,
+            "skip_ratio": skip_ratio,
+        }

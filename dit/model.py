@@ -323,19 +323,49 @@ class AdaLNMixin(BaseMixin):
         return output
 
     def process_lr(self, lr_imgs):
-        lr_imgs = self.proj_lr(lr_imgs)
-        lr_hidden_size = lr_imgs.shape[1]
+        """
+        将低分辨率图像处理为 cross-attention 所需的 patch 序列。
+        输入:  [B, 3, H, W]
+        输出: [B_blocks, 2304, hidden_size]，其中 B_blocks = B × block数
+        """
+        assert lr_imgs.dim() == 4, f"lr_imgs 输入维度错误，应为4D，实际为 {lr_imgs.dim()}D"
 
-        unFold = torch.nn.Unfold(kernel_size=3 * self.lr_block_size, stride=self.lr_block_size,
-                                 padding=self.lr_block_size)
-        lr_imgs = unFold(lr_imgs)
+        chunk_size = 4  # 分块处理以控制显存
+        unfolded_blocks = []
 
-        lr_imgs = lr_imgs.view(lr_imgs.shape[0], lr_hidden_size, self.lr_block_size * 3, self.lr_block_size * 3, -1)
-        lr_imgs = lr_imgs.permute(0, 4, 2, 3, 1).contiguous()
-        lr_imgs = lr_imgs.view(lr_imgs.shape[0] * lr_imgs.shape[1], -1, lr_imgs.shape[-1])
+        for img_chunk in lr_imgs.chunk(chunk_size, dim=0):
+            # Step 1: 卷积编码
+            img_chunk = self.proj_lr(img_chunk)  # [B, hidden_size, H', W']
+            B, C, H, W = img_chunk.shape
+
+            # Step 2: 使用 Unfold 提取 3x3 block
+            unfold = torch.nn.Unfold(
+                kernel_size=3 * self.lr_block_size,
+                stride=self.lr_block_size,
+                padding=self.lr_block_size
+            )
+            unfolded = unfold(img_chunk)  # [B, C * patch_area, N]
+
+            patch_area = (3 * self.lr_block_size) ** 2
+            N = unfolded.shape[-1]  # 通常为 patch 数
+
+            # Step 3: reshape → [B, C, patch_area, N]
+            unfolded = unfolded.view(B, C, patch_area, N)
+
+            # Step 4: permute → [B, N, patch_area, C]
+            unfolded = unfolded.permute(0, 3, 2, 1).contiguous()
+
+            # Step 5: reshape → [B*N, patch_area, C] → 最终序列格式
+            unfolded = unfolded.view(B * N, patch_area, C)
+            unfolded_blocks.append(unfolded)
+
+        # 拼接所有 chunk 后输出
+        lr_imgs = torch.cat(unfolded_blocks, dim=0)  # [B_blocks, 2304, hidden]
+        print(f"[process_lr] ✅ Final shape = {lr_imgs.shape}")
         return lr_imgs
 
-    def cross_attention_forward(self, hidden_states, lr_imgs, **kw_args):
+    def cross_attention_forward(self, hidden_states,  **kw_args):
+        lr_imgs = kw_args['lr_imgs']
         h, w = kw_args['hw']
         block_size = self.block_size
         in_x = h // block_size
@@ -438,8 +468,62 @@ class AdaLNMixin(BaseMixin):
         for layer in self.adaLN_modulations:
             nn.init.constant_(layer[-1].weight, 0)
             nn.init.constant_(layer[-1].bias, 0)
+
+class ConfigManager:
+    def __init__(self, args):
+        self.config = self._load_config(args)
+        self._validate_config()
+    
+    def _load_config(self, args):
+        # 使用 getattr 获取参数，如果不存在则使用默认值
+        return {
+            'image_size': getattr(args, 'image_size', 64),
+            'patch_size': getattr(args, 'patch_size', 4),
+            'num_patches': (getattr(args, 'image_size', 64) // getattr(args, 'patch_size', 4)) ** 2,
+            'sr_scale': getattr(args, 'sr_scale', 4),
+            'hidden_size': getattr(args, 'hidden_size', 1280),
+            'num_attention_heads': getattr(args, 'num_attention_heads', 16),
+            'block_size': getattr(args, 'block_size', 128),
+            'lr_patch_size': getattr(args, 'lr_patch_size', 2),  # 添加默认值
+            'cross_lr': getattr(args, 'cross_lr', False),
+            'qk_ln': getattr(args, 'qk_ln', False),
+            'random_position': getattr(args, 'random_position', False),
+            're_position': getattr(args, 're_position', False)
+        }
+    
+    def _validate_config(self):
+        # 验证配置
+        assert self.config['image_size'] % self.config['patch_size'] == 0, \
+            "image_size 必须能够整除 patch_size"
+        assert self.config['sr_scale'] in [2, 4, 8], "sr_scale 必须为2、4或8"
+        assert self.config['hidden_size'] % self.config['num_attention_heads'] == 0, \
+            "hidden_size 必须能够整除 num_attention_heads"
+
 class DiffusionEngine(BaseModel):
     def __init__(self, args, transformer=None, parallel_output=True, **kwargs):
+        # 初始化配置管理器
+        self.config_manager = ConfigManager(args)
+        config = self.config_manager.config
+        
+        # 基础参数初始化
+        self.image_size = config['image_size']
+        self.patch_size = config['patch_size']
+        self.num_patches = config['num_patches']
+        self.sr_scale = config['sr_scale']
+        self.hidden_size = config['hidden_size']
+        self.num_attention_heads = config['num_attention_heads']
+        self.block_size = config['block_size']
+        self.lr_patch_size = config['lr_patch_size']
+        self.cross_lr = config['cross_lr']
+        self.qk_ln = config['qk_ln']
+        self.random_position = config['random_position']
+        self.re_position = config['re_position']
+        
+        # 计算关键维度
+        self.lr_block_size = (self.block_size * self.patch_size) // (self.sr_scale * self.lr_patch_size)
+        self.lr_patch_num = self.lr_block_size * 3
+        
+        # 其他初始化代码...
         self.image_size = args.image_size
         self.patch_size = args.patch_size
         self.num_patches = (args.image_size // args.patch_size)**2
@@ -451,7 +535,6 @@ class DiffusionEngine(BaseModel):
         self.no_crossmask = args.no_crossmask
         self.stop_grad_patch_embed = args.stop_grad_patch_embed
         self.sr_scale = args.sr_scale
-        self.random_position = args.random_position
         self.random_direction = args.random_direction
         self.image_block_size = args.image_block_size
         if self.random_direction:
@@ -468,30 +551,17 @@ class DiffusionEngine(BaseModel):
         super().__init__(args, transformer=transformer, layernorm=partial(LayerNorm, elementwise_affine=False, eps=1e-6),  **kwargs)
         
         configs = OmegaConf.load(args.config_path)
+        print(f"[DiffusionEngine] Loaded config from {args.config_path}")
+        print(f"[DiffusionEngine] Initial config: {configs}")
         
-        # 🧱 强化保底
-        configs.setdefault("sampler_config", {})
-        configs["sampler_config"].setdefault("guider_config", {})
-        configs["sampler_config"]["guider_config"].setdefault("params", {})
-
-        # 🛠 注入 guider 替换
-        if getattr(args, "guider", None):
-            guider_target = f"dit.sampling.guiders.{args.guider}"
-            configs["sampler_config"]["guider_config"]["target"] = guider_target
-            print(f"[DiffusionEngine] ✅ Overriding guider: {guider_target}")
-
-        if getattr(args, "guiderscale", None) is not None:
-            configs["sampler_config"]["guider_config"]["params"]["scale"] = args.guiderscale
-            print(f"[DiffusionEngine] ✅ Overriding guider scale: {args.guiderscale}")
-
         module_configs = configs.pop('modules', None)
         modeling_configs = configs.pop('modeling', None)
-
 
         self._build_modules(args, module_configs)
         self._build_modeling(args, modeling_configs)
 
         self.collect_attention = None
+
     def _build_modules(self, args, module_configs):
 
         pos_embed_config = module_configs.pop('position_embedding_config')
@@ -546,13 +616,48 @@ class DiffusionEngine(BaseModel):
             self.image_encoder = None
 
     def _build_modeling(self, args, modeling_configs):
+        from dit.utils import instantiate_from_config
         precond_config = modeling_configs.pop('precond_config')
         self.precond = instantiate_from_config(precond_config)
         
         loss_config = modeling_configs.pop('loss_config')
         self.loss_func = instantiate_from_config(loss_config)
         sampler_config = modeling_configs.pop('sampler_config')
+        
+        # Debug logging for sampler config
+        print(f"[DiffusionEngine] Initial sampler config: {sampler_config}")
+        
+        # 确保 sampler_config 有 params 字段
+        if 'params' not in sampler_config:
+            sampler_config['params'] = {}
+        
+        # 确保 params 中有 guider_config
+        if 'guider_config' not in sampler_config['params']:
+            sampler_config['params']['guider_config'] = {}
+        
+        # 设置 guider
+        if getattr(args, "guider", None):
+            guider_target = f"dit.sampling.guiders.{args.guider}"
+            sampler_config['params']['guider_config']['target'] = guider_target
+            print(f"[DiffusionEngine] ✅ Setting guider in sampler config: {guider_target}")
+            print(f"[DiffusionEngine] Updated sampler config: {sampler_config}")
+            
+        if getattr(args, "guiderscale", None) is not None:
+            sampler_config['params']['guider_config']['params'] = sampler_config['params']['guider_config'].get('params', {})
+            sampler_config['params']['guider_config']['params']['scale'] = args.guiderscale
+            print(f"[DiffusionEngine] ✅ Setting guider scale in sampler config: {args.guiderscale}")
+            print(f"[DiffusionEngine] Updated sampler config: {sampler_config}")
+        
+        # 实例化 sampler
         self.sampler = instantiate_from_config(sampler_config)
+        print(f"[DiffusionEngine] Sampler initialized: {self.sampler}")
+        
+        # 直接使用 sampler 的 guider 属性
+        if hasattr(self.sampler, 'guider'):
+            print(f"[DiffusionEngine] Found guider in sampler: {self.sampler.guider}")
+            self.guider = self.sampler.guider
+        else:
+            print(f"[DiffusionEngine] No guider available in sampler")
     
     def disable_untrainable_params(self):
         disable_prefixs = ["text_encoder", "first_stage_model", "image_encoder"]
@@ -607,6 +712,7 @@ class DiffusionEngine(BaseModel):
         group.add_argument('--lr-dropout', default=0, type=float)
         group.add_argument('--re-position', action='store_true')
         group.add_argument('--cross-lr', action='store_true')
+        group.add_argument('--lr-patch-size', type=int, default=2)
         return parser
     
     @classmethod
@@ -625,49 +731,31 @@ class DiffusionEngine(BaseModel):
         kwargs['input_ids'] = kwargs['position_ids'] = kwargs['attention_mask'] = torch.ones((1,1)).to(sigmas.dtype)
         return super().forward(*args, **kwargs)
 
-    def precond_forward(self, inference, rope_position_ids, concat_lr_imgs, lr_imgs=None, ar=False,
+    def precond_forward(self, inference, rope_position_ids, ar=False,
                         ar2=False, sample_step=None, block_batch=1, *args, **kwargs):
         """
-        执行扩散模型的前向推理，支持三种推理模式：全图推理、逐块自回归推理(ar)和批量块自回归推理(ar2)
-
-        参数:
-            inference: 布尔值，指示是否处于推理模式
-            rope_position_ids: 用于旋转位置编码(RoPE)的位置ID张量
-            concat_lr_imgs: 用于与主图像拼接的低分辨率图像
-            lr_imgs: 原始低分辨率图像，用于条件生成，可选
-            ar: 布尔值，是否使用自回归模式(每次处理一个块)
-            ar2: 布尔值，是否使用批量自回归模式(每次处理多个块)
-            sample_step: 当前采样步骤，用于确定处理方向
-            block_batch: 在ar2模式下每次处理的块批次大小
-            *args, **kwargs: 传递给model_forward的额外参数
-
-        返回:
-            处理后的图像张量
+        执行扩散模型的前向推理，支持三种推理模式：全图推理、逐块自回归(ar)和批量块自回归(ar2)
         """
-        # 从kwargs中获取输入图像和噪声水平
-        images, sigmas = kwargs["images"], kwargs["sigmas"]
 
-        # 将低分辨率图像与主图像在通道维度上拼接，增加条件信息
-        images = torch.cat((images, concat_lr_imgs), dim=1)
+        # ===【统一获取输入】===
+        images = kwargs["images"]
+        sigmas = kwargs["sigmas"]
+        # concat_lr_imgs = kwargs["concat_lr_imgs"]
+        # lr_imgs = kwargs.get("lr_imgs", None)
 
         # TODO: 优化低分辨率图像的内存使用
         # lr_imgs = lr_imgs[:, :, :128, :128]
 
+        # ===【拼接 concat 图像】===
+        images = torch.cat((images,kwargs["concat_lr_imgs"]), dim=1)
+
         # 如果启用了cross_lr选项，对低分辨率图像进行预处理
         if self.mixins['adaln_layer'].cross_lr:
-            lr_imgs = self.mixins['adaln_layer'].process_lr(lr_imgs)
+            kwargs["lr_imgs"] = self.mixins['adaln_layer'].process_lr(kwargs["lr_imgs"])
 
-        # 获取图像的高度和宽度
+        # ===【图像尺寸 & 时间调制系数】===
         h, w = images.shape[2:4]
-
-        # 计算扩散过程中的各种系数
-        # c_skip: 原始图像的权重系数
-        # c_out: 模型输出的权重系数
-        # c_in: 模型输入的缩放系数
-        # c_noise: 噪声的缩放系数
         c_skip, c_out, c_in, c_noise = map(lambda t: t.to(images.dtype), self.precond(append_dims(sigmas, images.ndim)))
-
-        # 应用缩放因子调整图像值范围
         images *= self.scale_factor
 
         # 模式1：自回归(AR)模式 - 每次处理一个块
@@ -738,7 +826,7 @@ class DiffusionEngine(BaseModel):
                     # 执行模型前向传播
                     output, *output_per_layers = self.model_forward(*args, hw=[vit_block_size, vit_block_size],
                                                                     mems=mems, inference=1,
-                                                                    lr_imgs=lr_imgs[lr_id:lr_id + 1], **kwargs)
+                                                                    lr_imgs=kwargs["lr_imgs"][lr_id:lr_id + 1], **kwargs)
 
                     # 应用输出缩放系数和跳跃连接
                     output = output * c_out + tmp_images[:, :self.out_channels] * c_skip
@@ -896,8 +984,7 @@ class DiffusionEngine(BaseModel):
 
             # 执行模型前向传播，处理整个图像
             output, *output_per_layers = self.model_forward(*args, hw=[h // self.patch_size, w // self.patch_size],
-                                                            rope_position_ids=rope_position_ids,
-                                                            lr_imgs=lr_imgs, **kwargs)
+                                                            rope_position_ids=rope_position_ids, **kwargs)
 
             # 应用输出缩放系数和跳跃连接
             output = output * c_out + images[:, :self.out_channels] * c_skip
@@ -970,6 +1057,9 @@ class DiffusionEngine(BaseModel):
             ar2=False,  # 是否使用第二种自回归模式
             block_batch=1,  # 块批处理大小
     ):
+        # ✅ 实例化 guider（通用方式，兼容所有类型）
+        print(f"[DiffusionEngine.sample] Starting sampling with guider: {getattr(self, 'guider', None)}")
+        
         # 如果没有提供输入图像，则创建随机噪声作为起始点
         if images is None:
             images = torch.randn(*shape).to(dtype).to(device)
@@ -981,7 +1071,6 @@ class DiffusionEngine(BaseModel):
         # 如果提供了第二张图像，将其添加到条件字典中
         if image_2 is not None:
             cond["image2"] = image_2
-
         # 如果有图像编码器，处理低分辨率图像并创建嵌入
         if self.image_encoder:
             if image_2 is not None:
@@ -1026,27 +1115,57 @@ class DiffusionEngine(BaseModel):
         # 启用Transformer输出隐藏状态
         self.transformer.output_hidden_states = True
 
-        # 定义去噪函数，使用预条件前向传播
-        denoiser = lambda images, sigmas, rope_position_ids, cond, sample_step: self.precond_forward(
-            images=images,
-            sigmas=sigmas,
-            rope_position_ids=rope_position_ids,
-            inference=True,
-            sample_step=sample_step,
-            do_concat=do_concat,
-            ar=ar,
-            ar2=ar2,
-            block_batch=block_batch,
-            **cond
-        )
+        def wrapped_denoiser(images, sigmas, rope_position_ids, cond, sample_step):
+            if hasattr(self, 'guider') and self.guider is not None:
+                print(f"[DiffusionEngine.sample] Using guider: {self.guider}")
+                # guider 预处理输入
+                x, sigma, c, rope_ids = self.guider.prepare_inputs(images, sigmas, cond, None, rope_position_ids)
+                if x is None:
+                    return None
+
+                # 构造 kwargs：全部通过字典传参，避免重复
+                c = c.copy()
+                c['images'] = x
+                c['sigmas'] = sigma
+
+                # 调用去噪接口（不再显式传递 lr_imgs 等）
+                denoised = self.precond_forward(
+                    inference=0,
+                    rope_position_ids=rope_ids,
+                    # concat_lr_imgs=None,
+                    ar=ar,
+                    ar2=ar2,
+                    sample_step=sample_step,
+                    block_batch=block_batch,
+                    **c
+                )
+                return self.guider(denoised, sigma)
+
+            else:
+                print(f"[DiffusionEngine.sample] No guider available, using default denoising")
+                # 默认路径，同样只通过 kwargs 传参
+                cond = cond.copy()
+                cond['images'] = images
+                cond['sigmas'] = sigmas
+
+                return self.precond_forward(
+                    inference=0,
+                    rope_position_ids=rope_position_ids,
+                    # concat_lr_imgs=None,
+                    ar=ar,
+                    ar2=ar2,
+                    sample_step=sample_step,
+                    block_batch=block_batch,
+                    **cond
+                )
 
         # 如果需要返回注意力图，初始化注意力收集列表
         if return_attention_map:
             self.collect_attention = []
 
         # 执行采样过程
-        samples = self.sampler(
-            denoiser=denoiser,
+        samples = self.sampler(    #sampler会dit.sampling.samplers.BaseDiffusionSampler,根据参数自动匹配到其中的denoise函数，然后再调用上面的具体denoiser函数
+            denoiser=wrapped_denoiser,
             x=None,
             cond=cond,
             uc=uncond,

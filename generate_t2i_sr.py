@@ -26,6 +26,7 @@ from PIL import Image
 import webdataset as wds
 import io
 import cv2
+from dit.utils import instantiate_from_config
 
 
 def read_from_cli():
@@ -175,6 +176,10 @@ def main(args, device=torch.device('cuda')):
                 PIL.Image.fromarray(image_np[:, :, 0], 'L').save(image_path)
             else:
                 PIL.Image.fromarray(image_np, 'RGB').save(image_path)
+
+        # 保存生成的图像
+        # save_image(samples, os.path.join(args.out_dir, 'n_sr.png'))
+
 
 
 def add_sample_specific_args(parser):

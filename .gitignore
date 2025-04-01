@@ -1,2 +1,7 @@
-.idea/
+# 忽略 .idea 下的所有文件
+.idea/*
+
+# 但允许同步书签文件（取消忽略）
+!.idea/workspace.xml
+
 .DS_Store

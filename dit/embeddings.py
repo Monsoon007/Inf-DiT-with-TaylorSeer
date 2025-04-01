@@ -122,26 +122,40 @@ class ImagePatchEmbeddingMixin(BaseMixin):
         if reg_token_num > 0:
             self.register_parameter('reg_token_emb', nn.Parameter(torch.zeros(reg_token_num, hidden_size)))
             nn.init.normal_(self.reg_token_emb, mean=0., std=0.02)
-
     
     def word_embedding_forward(self, input_ids, **kwargs):
+        """
+        Forward pass for image patch embedding.
+        This method is called by SAT framework.
+        
+        Args:
+            input_ids: Not used, kept for compatibility
+            **kwargs: Additional arguments containing 'images' tensor
+            
+        Returns:
+            Tensor of shape (B, N, D) where N is the number of patches and D is hidden_size
+        """
         images = kwargs["images"]
         emb = self.proj(images)
         emb = emb.flatten(2).transpose(1, 2)
-        if self.append_emb:
-            emb = torch.cat((kwargs["emb"][:, None, :], emb), dim=1)
+        
+        # Add register tokens if needed
         if self.reg_token_num > 0:
             emb = torch.cat((self.reg_token_emb[None, ...].repeat(emb.shape[0], 1, 1), emb), dim=1)
-        if self.add_emb:
+            
+        # Add additional embeddings if needed
+        if self.append_emb and "emb" in kwargs:
+            emb = torch.cat((kwargs["emb"][:, None, :], emb), dim=1)
+        if self.add_emb and "emb" in kwargs:
             emb = emb + kwargs["emb"][:, None, :]
+            
         return emb
 
     def reinit(self, parent_model=None):
         w = self.proj.weight.data
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
         nn.init.constant_(self.proj.bias, 0)
-        del self.transformer.word_embeddings
-    
+
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
     """

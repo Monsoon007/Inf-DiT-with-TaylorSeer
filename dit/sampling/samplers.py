@@ -13,8 +13,10 @@ import numpy as np
 from dit.sampling.utils import linear_multistep_coeff
 import torchvision
 from torchvision.transforms.functional import InterpolationMode
-DEFAULT_GUIDER = {"target": "dit.sampling.guiders.IdentityGuider"}
+from fvcore.nn import FlopCountAnalysis
 
+
+DEFAULT_GUIDER = {"target": "dit.sampling.guiders.IdentityGuider"}
 def to_d(x, sigma, denoised):
     return (x - denoised) / append_dims(sigma, x.ndim)
 
@@ -58,12 +60,18 @@ class BaseDiffusionSampler:
         # 准备输入（可能提前判断 skip）
         images, sigmas, cond, rope_position_ids = self.guider.prepare_inputs(x, sigma, cond, uc, rope_position_ids)
 
-        if getattr(self.guider, "_skip_step", False):
+
+        # 如果为<dit.sampling.guiders.IdentityGuider object at 0x7feed424ab10>则没有启用成功taylorguider
+        if self.guider.__class__.__name__ == "IdentityGuider":
+            print("没有启用成功taylorguider")
+
+        if getattr(self.guider, "_skip_cur_step", False): #如果 _skip_cur_step 存在且值为 True，那么 getattr 会返回 True，if 条件成立。
             # ⚡ 跳过模型推理
+            print(self.guider._skip_cur_step)
             denoised = self.guider(None, sigma)
         else:
             # 🧠 正常调用 denoiser（DiT 模型）
-            denoised = denoiser(images, sigmas, rope_position_ids, cond, sample_step)
+            denoised = denoiser(images, sigmas, rope_position_ids, cond, sample_step) # 会调用dit/model.py:1118
             denoised = self.guider(denoised, sigma)
 
         return denoised
