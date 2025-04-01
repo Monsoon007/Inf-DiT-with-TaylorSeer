@@ -735,6 +735,7 @@ class DiffusionEngine(BaseModel):
                         ar2=False, sample_step=None, block_batch=1, *args, **kwargs):
         """
         执行扩散模型的前向推理，支持三种推理模式：全图推理、逐块自回归(ar)和批量块自回归(ar2)
+        在EDM的框架（例如Karras et al., EDM, 2022）中，最终模型输出即对应于去噪后的图像预测
         """
 
         # ===【统一获取输入】===
@@ -1115,46 +1116,40 @@ class DiffusionEngine(BaseModel):
         # 启用Transformer输出隐藏状态
         self.transformer.output_hidden_states = True
 
-        def wrapped_denoiser(images, sigmas, rope_position_ids, cond, sample_step):
+        # 定义去噪函数
+        def denoiser(images, sigmas, rope_position_ids, cond, sample_step, uc=None):
             if hasattr(self, 'guider') and self.guider is not None:
                 print(f"[DiffusionEngine.sample] Using guider: {self.guider}")
                 # guider 预处理输入
-                x, sigma, c, rope_ids = self.guider.prepare_inputs(images, sigmas, cond, None, rope_position_ids)
+                x, sigma, c, rope_ids = self.guider.prepare_inputs(images, sigmas, cond, uc, rope_position_ids)
                 if x is None:
                     return None
 
-                # 构造 kwargs：全部通过字典传参，避免重复
+                # 构造 kwargs
                 c = c.copy()
                 c['images'] = x
                 c['sigmas'] = sigma
 
-                # 调用去噪接口（不再显式传递 lr_imgs 等）
-                denoised = self.precond_forward(
-                    inference=0,
+                # 调用去噪接口
+                return self.precond_forward(
                     rope_position_ids=rope_ids,
-                    # concat_lr_imgs=None,
+                    inference=True,
+                    sample_step=sample_step,
+                    do_concat=do_concat,
                     ar=ar,
                     ar2=ar2,
-                    sample_step=sample_step,
                     block_batch=block_batch,
                     **c
                 )
-                return self.guider(denoised, sigma)
-
             else:
-                print(f"[DiffusionEngine.sample] No guider available, using default denoising")
-                # 默认路径，同样只通过 kwargs 传参
-                cond = cond.copy()
-                cond['images'] = images
-                cond['sigmas'] = sigmas
-
+                # 默认行为：直接调用 precond_forward
                 return self.precond_forward(
-                    inference=0,
                     rope_position_ids=rope_position_ids,
-                    # concat_lr_imgs=None,
+                    inference=True,
+                    sample_step=sample_step,
+                    do_concat=do_concat,
                     ar=ar,
                     ar2=ar2,
-                    sample_step=sample_step,
                     block_batch=block_batch,
                     **cond
                 )
@@ -1165,7 +1160,7 @@ class DiffusionEngine(BaseModel):
 
         # 执行采样过程
         samples = self.sampler(    #sampler会dit.sampling.samplers.BaseDiffusionSampler,根据参数自动匹配到其中的denoise函数，然后再调用上面的具体denoiser函数
-            denoiser=wrapped_denoiser,
+            denoiser=denoiser,
             x=None,
             cond=cond,
             uc=uncond,
@@ -1186,4 +1181,9 @@ class DiffusionEngine(BaseModel):
             attention_maps = self.collect_attention
             self.collect_attention = None
             return samples, attention_maps
+            
+        # 打印 TaylorSeerGuider 的统计信息
+        if hasattr(self, 'guider') and self.guider is not None:
+            self.guider.get_stats()
+            
         return samples
