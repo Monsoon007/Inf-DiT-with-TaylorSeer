@@ -170,7 +170,33 @@ def main(args, device=torch.device('cuda')):
             image_dir = args.out_dir
             text = image_name[i].split('/')[-1]
             os.makedirs(image_dir, exist_ok=True)
-            image_path = os.path.join(image_dir, f'{text}_sr.png')
+            
+            # 构建参数化的文件名
+            param_str = []
+            if hasattr(args, 'guider') and args.guider:
+                if args.guider == "TaylorSeerGuider":
+                    param_str.append("TaylorSeer")
+                else:
+                    param_str.append(f"guider_{args.guider}")
+                    
+            if hasattr(args, 'guiderscale') and args.guiderscale is not None:
+                param_str.append(f"scale_{args.guiderscale}")
+                
+            if args.guider == "TaylorSeerGuider" and hasattr(args, 'max_order'):
+                param_str.append(f"order_{args.max_order}")
+                
+            if args.guider == "TaylorSeerGuider" and hasattr(args, 'interval'):
+                param_str.append(f"interval_{args.interval}")
+                
+            # 修改缓存标记逻辑：默认不添加标记，只在明确禁用缓存时添加标记
+            if args.guider == "TaylorSeerGuider" and hasattr(args, 'use_cache'):
+                # TaylorSeer默认启用缓存，只有明确设置为False时才添加标记
+                if hasattr(args, 'disable_cache') and args.disable_cache:
+                    param_str.append("cache_disabled")
+                
+            param_suffix = "_".join(param_str) if param_str else "baseline"
+            timestamp = time.strftime("%m%d_%H%M%S")
+            image_path = os.path.join(image_dir, f'{text}_{param_suffix}_{timestamp}_sr.png')
             print("save to", image_path)
             if image_np.shape[2] == 1:
                 PIL.Image.fromarray(image_np[:, :, 0], 'L').save(image_path)
@@ -199,10 +225,19 @@ def add_sample_specific_args(parser):
     group.add_argument('--inference_type', type=str, default='full', choices=['full', 'ar', 'ar2'])
     group.add_argument('--block_batch', type=int, default=1)
 
-    # ✅ 添加 guider 参数
+    # TaylorSeer 相关参数
     group.add_argument('--guider', type=str, default=None,
                        help='Override guider class (e.g. VanillaCFG, IdentityGuider, TaylorSeerGuider)')
     group.add_argument('--guiderscale', type=float, default=None, help='Override CFG/TaylorSeer scale')
+    group.add_argument('--max_order', type=int, default=2, help='Maximum order for Taylor expansion')
+    group.add_argument('--interval', type=int, default=4, help='Interval between cached steps')
+    
+    # 缓存相关参数
+    cache_group = group.add_mutually_exclusive_group()
+    cache_group.add_argument('--use_cache', action='store_true', 
+                           help='[已废弃] 默认已启用缓存，此参数将在未来版本移除')
+    cache_group.add_argument('--disable_cache', action='store_true',
+                             help='禁用TaylorSeer的缓存功能，提高准确度但降低速度')
 
     return parser
 

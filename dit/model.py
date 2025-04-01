@@ -1182,8 +1182,11 @@ class DiffusionEngine(BaseModel):
             self.collect_attention = None
             return samples, attention_maps
             
-        # 打印 TaylorSeerGuider 的统计信息
+        # 打印 TaylorSeerGuider 的统计信息 - 添加类型检查
         if hasattr(self, 'guider') and self.guider is not None:
-            self.guider.get_stats()
+            if hasattr(self.guider, 'get_stats'):
+                self.guider.get_stats()
+            else:
+                print(f"[DiffusionEngine.sample] Guider {type(self.guider).__name__} does not support statistics")
             
         return samples

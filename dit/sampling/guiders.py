@@ -58,11 +58,14 @@ class IdentityGuider:
 
 
 class TaylorSeerGuider:
-    def __init__(self, scale=5.0, use_cache=True, step_threshold=0.05, interval=4, max_order=2):
+    def __init__(self, scale=5.0, use_cache=True, step_threshold=0.05, interval=4, max_order=2, disable_cache=False):
         self.scale = scale
-        print(f"[TaylorSeerGuider] 初始化引导器: scale={scale}, use_cache={use_cache}, interval={interval}, max_order={max_order}")
         
-        self.use_cache = use_cache
+        # 处理缓存参数，优先使用disable_cache参数
+        self.use_cache = False if disable_cache else use_cache
+        
+        print(f"[TaylorSeerGuider] 初始化引导器: scale={scale}, use_cache={self.use_cache}, interval={interval}, max_order={max_order}")
+        
         self.interval = interval
         self.max_order = max_order
         self.total_steps = 0
@@ -73,6 +76,9 @@ class TaylorSeerGuider:
         
         if self._identity_mode:
             print("[TaylorSeerGuider] ⚠️  scale=0 → Running in IdentityGuider mode (single batch, no guidance)")
+        
+        if not self.use_cache:
+            print("[TaylorSeerGuider] ⚠️ 缓存已禁用，将进行完整计算")
             
         self.cache = {
             'noise_cache': {},

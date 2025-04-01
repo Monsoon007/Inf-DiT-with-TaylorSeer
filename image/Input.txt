@@ -1,1 +1,1 @@
-/root/Inf-DiT-with-TaylorSeer/image/natural_landscape_128x128.png
+/root/Inf-DiT-with-TaylorSeer/samples/cat512.png
